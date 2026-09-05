@@ -56,6 +56,7 @@ struct priv {
 
     void *chunk;
     int chunksize;
+    int pending_bytes;
     jbyteArray bytearray;
     jshortArray shortarray;
     jfloatArray floatarray;
@@ -73,12 +74,12 @@ struct priv {
 
 static struct JNIByteBuffer {
     jclass clazz;
-    jmethodID clear;
+    jmethodID position;
 } ByteBuffer;
 #define OFFSET(member) offsetof(struct JNIByteBuffer, member)
 static const struct MPJniField ByteBuffer_mapping[] = {
     {"java/nio/ByteBuffer", NULL, MP_JNI_CLASS, OFFSET(clazz), 1},
-    {"clear", "()Ljava/nio/Buffer;", MP_JNI_METHOD, OFFSET(clear), 1},
+    {"position", "(I)Ljava/nio/Buffer;", MP_JNI_METHOD, OFFSET(position), 1},
     {0},
 };
 #undef OFFSET
@@ -517,13 +518,13 @@ static double AudioTrack_getLatency(struct ao *ao)
     return MPCLAMP(delay, 0.0, 2.0);
 }
 
-static int AudioTrack_write(struct ao *ao, int len)
+static int AudioTrack_write(struct ao *ao, int offset, int len)
 {
     struct priv *p = ao->priv;
     if (!p->audiotrack)
         return -1;
     JNIEnv *env = MP_JNI_GET_ENV(ao);
-    void *buf = p->chunk;
+    void *buf = (char *)p->chunk + offset;
 
     jint ret;
     if (p->format == AudioFormat.ENCODING_IEC61937) {
@@ -534,8 +535,7 @@ static int AudioTrack_write(struct ao *ao, int len)
         if (ret > 0) ret *= 2;
 
     } else if (AudioTrack.writeBufferV21) {
-        // reset positions for reading
-        jobject bbuf = MP_JNI_CALL_OBJECT(p->bbuf, ByteBuffer.clear);
+        jobject bbuf = MP_JNI_CALL_OBJECT(p->bbuf, ByteBuffer.position, offset);
         if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
         MP_JNI_LOCAL_FREEP(&bbuf);
         ret = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.writeBufferV21, p->bbuf, len, AudioTrack.WRITE_BLOCKING);
@@ -611,13 +611,26 @@ static MP_THREAD_VOID ao_thread(void *arg)
         }
         if (state == AudioTrack.PLAYSTATE_PLAYING) {
             int read_samples = p->chunksize / ao->sstride;
-            int64_t ts = mp_time_ns();
-            ts += MP_TIME_S_TO_NS(read_samples / (double)(ao->samplerate));
-            ts += MP_TIME_S_TO_NS(AudioTrack_getLatency(ao));
-            int samples = ao_read_data(ao, &p->chunk, read_samples, ts, NULL, false, false);
-            int ret = AudioTrack_write(ao, samples * ao->sstride);
-            if (ret >= 0) {
-                p->written_frames += ret / ao->sstride;
+            int bytes = read_samples * ao->sstride;
+            if (!p->pending_bytes) {
+                int64_t ts = mp_time_ns();
+                ts += MP_TIME_S_TO_NS(read_samples / (double)(ao->samplerate));
+                ts += MP_TIME_S_TO_NS(AudioTrack_getLatency(ao));
+                // Keep the device clock running through an underrun, but do
+                // not overwrite data left over from a partial AudioTrack write.
+                ao_read_data(ao, &p->chunk, read_samples, ts, NULL, true, true);
+                p->pending_bytes = bytes;
+            }
+            int offset = bytes - p->pending_bytes;
+            int ret = AudioTrack_write(ao, offset, p->pending_bytes);
+            if (ret > 0) {
+                p->pending_bytes -= ret;
+                p->written_frames += (offset + ret) / ao->sstride -
+                                     offset / ao->sstride;
+            } else if (ret == 0) {
+                // pause() can interrupt a blocking write. Keep the pending data
+                // until reset and avoid spinning if the driver makes no progress.
+                mp_cond_timedwait(&p->wakeup, &p->lock, MP_TIME_MS_TO_NS(10));
             } else if (ret == AudioManager.ERROR_DEAD_OBJECT) {
                 MP_WARN(ao, "AudioTrack.write failed with ERROR_DEAD_OBJECT. Reloading audio output...\n");
                 // Renegotiate the carrier and reset playback state in the core.
@@ -625,6 +638,8 @@ static MP_THREAD_VOID ao_thread(void *arg)
                 break;
             } else {
                 MP_ERR(ao, "AudioTrack.write failed with %d\n", ret);
+                ao_request_reload(ao);
+                break;
             }
         } else {
             mp_cond_timedwait(&p->wakeup, &p->lock, MP_TIME_MS_TO_NS(300));
@@ -843,14 +858,18 @@ static void stop(struct ao *ao)
     JNIEnv *env = MP_JNI_GET_ENV(ao);
     MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.pause);
     MP_JNI_EXCEPTION_LOG(ao);
+    // Interrupt the blocking write before taking the writer's lock.
+    mp_mutex_lock(&p->lock);
     MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.flush);
     MP_JNI_EXCEPTION_LOG(ao);
 
+    p->pending_bytes = 0;
     p->playhead_offset = 0;
     p->reset_pending = true;
     p->written_frames = 0;
     p->timestamp_fetched = 0;
     p->timestamp_set = false;
+    mp_mutex_unlock(&p->lock);
 }
 
 static void start(struct ao *ao)
@@ -862,10 +881,12 @@ static void start(struct ao *ao)
     }
 
     JNIEnv *env = MP_JNI_GET_ENV(ao);
+    mp_mutex_lock(&p->lock);
     MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.play);
     MP_JNI_EXCEPTION_LOG(ao);
 
     mp_cond_signal(&p->wakeup);
+    mp_mutex_unlock(&p->lock);
 }
 
 #define OPT_BASE_STRUCT struct priv
