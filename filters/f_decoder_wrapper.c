@@ -202,6 +202,8 @@ struct priv {
     double start, end;
     struct demux_packet *new_segment;
     struct mp_frame packet;
+    struct mp_frame retry_packet;
+    bool using_spdif;
     bool packet_fed, preroll_discard;
 
     size_t reverse_queue_byte_size;
@@ -320,6 +322,7 @@ static void reset_decoder_state(struct priv *p)
     p->has_broken_decoded_pts = 0;
     p->packets_without_output = 0;
     mp_frame_unref(&p->packet);
+    mp_frame_unref(&p->retry_packet);
     p->packet_fed = false;
     p->preroll_discard = false;
     talloc_free(p->new_segment);
@@ -454,14 +457,17 @@ struct mp_decoder_list *audio_decoder_list(void)
     return list;
 }
 
-static bool reinit_decoder(struct priv *p)
+static bool reinit_decoder(struct priv *p, bool reset)
 {
     if (p->decoder)
         talloc_free(p->decoder->f);
     p->decoder = NULL;
 
-    reset_decoder_state(p);
-    p->has_broken_packet_pts = -10; // needs 10 packets to reach decision
+    if (reset) {
+        reset_decoder_state(p);
+        p->has_broken_packet_pts = -10; // needs 10 packets to reach decision
+    }
+    p->using_spdif = false;
 
     const struct mp_decoder_fns *driver = NULL;
     struct mp_decoder_list *list = NULL;
@@ -522,6 +528,9 @@ static bool reinit_decoder(struct priv *p)
 
         p->decoder = driver->create(p->decf, p->codec, sel->decoder);
         if (p->decoder) {
+            p->using_spdif = driver == &ad_spdif;
+            if (p->using_spdif)
+                mp_filter_set_error_handler(p->decoder->f, p->decf);
             p->codec->decoder = talloc_strdup(p->codec, sel->decoder);
             p->codec->decoder_desc = talloc_strdup(p->codec, sel->desc && sel->desc[0] ? sel->desc : NULL);
             MP_VERBOSE(p, "Selected decoder: %s", sel->decoder);
@@ -558,7 +567,7 @@ static bool reinit_decoder(struct priv *p)
 static bool decoder_wrapper_reinit(struct mp_decoder_wrapper *d)
 {
     struct priv *p = d->f->priv;
-    return reinit_decoder(p);
+    return reinit_decoder(p, true);
 }
 
 bool mp_decoder_wrapper_reinit(struct mp_decoder_wrapper *d)
@@ -572,7 +581,8 @@ bool mp_decoder_wrapper_reinit(struct mp_decoder_wrapper *d)
         return true;
     }
     thread_lock(p);
-    bool res = reinit_decoder(p);
+    bool res = reinit_decoder(p, true);
+    mp_filter_wakeup(p->decf);
     thread_unlock(p);
     return res;
 }
@@ -992,6 +1002,13 @@ static void feed_packet(struct priv *p)
     if (!p->decoder || !mp_pin_in_needs_data(p->decoder->f->pins[0]))
         return;
 
+    // This packet already passed the timestamp/recorder bookkeeping below.
+    if (p->retry_packet.type) {
+        mp_pin_in_write(p->decoder->f->pins[0], p->retry_packet);
+        p->retry_packet = MP_NO_FRAME;
+        return;
+    }
+
     if (p->decoded_coverart.type)
         return;
 
@@ -1226,6 +1243,20 @@ static void decf_process(struct mp_filter *f)
 
     if (m_config_cache_update(p->opt_cache))
         update_queue_config(p);
+
+    if (p->using_spdif && mp_filter_has_failed(p->decoder->f)) {
+        struct demux_packet *packet = talloc_steal(NULL, p->decoder->failed_packet);
+        p->decoder->failed_packet = NULL;
+        MP_VERBOSE(p, "Passthrough muxing failed. Falling back to PCM decoding.\n");
+        mp_decoder_wrapper_set_spdif_flag(&p->public, false);
+        if (!reinit_decoder(p, false)) {
+            talloc_free(packet);
+            mp_filter_internal_mark_failed(f);
+            return;
+        }
+        if (packet)
+            p->retry_packet = MAKE_FRAME(MP_FRAME_PACKET, packet);
+    }
 
     feed_packet(p);
     read_frame(p);

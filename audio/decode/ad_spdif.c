@@ -112,6 +112,9 @@ static void ad_spdif_reset(struct mp_filter *da)
 
     close_lavf_context(spdif_ctx, false);
     spdif_ctx->dropped_startup_packets = 0;
+    TA_FREEP(&spdif_ctx->public.failed_packet);
+    // A seek must also cancel a pending fallback for the discarded packet.
+    mp_filter_has_failed(da);
 }
 
 static bool truehd_has_major_sync(const AVPacket *pkt)
@@ -354,6 +357,9 @@ static void ad_spdif_process(struct mp_filter *da)
 {
     struct spdifContext *spdif_ctx = da->priv;
 
+    if (spdif_ctx->public.failed_packet)
+        return;
+
     if (!mp_pin_can_transfer_data(da->ppins[1], da->ppins[0]))
         return;
 
@@ -434,12 +440,14 @@ static void ad_spdif_process(struct mp_filter *da)
     mp_aframe_set_pts(out, pts);
 
 done:
-    talloc_free(mpkt);
     if (out) {
+        talloc_free(mpkt);
         mp_pin_in_write(da->ppins[1], MAKE_FRAME(MP_FRAME_AUDIO, out));
     } else if (drop_packet) {
+        talloc_free(mpkt);
         mp_filter_internal_mark_progress(da);
     } else {
+        spdif_ctx->public.failed_packet = talloc_steal(da, mpkt);
         mp_filter_internal_mark_failed(da);
     }
 }

@@ -1066,8 +1066,9 @@ end
 
 local function add_audio(s)
     local r = mp.get_property_native("audio-params")
+    local output = mp.get_property_native("audio-out-params")
     -- in case of e.g. lavfi-complex there can be no input audio, only output
-    local ro = mp.get_property_native("audio-out-params") or r
+    local ro = output or r
     r = r or ro
     if not r then
         return
@@ -1092,6 +1093,13 @@ local function add_audio(s)
     end
     append_property(s, "current-ao", {prefix="AO:", nl="",
                                       indent=o.prefix_sep .. o.prefix_sep})
+    if output and output.format then
+        local passthrough = output.format:match("^spdif%-") ~= nil
+        append(s, passthrough and "Passthrough (IEC61937)" or "PCM", {prefix="Output:"})
+        if mp.get_property_native("audio-passthrough-failed", false) then
+            append(s, "Passthrough output initialization failed", {prefix="Fallback:"})
+        end
+    end
     local dev = append_property(s, "audio-device", {prefix="Device:"})
     local ao_mute = mp.get_property_native("ao-mute") and " (Muted)" or ""
     append_property(s, "ao-volume", {prefix="AO Volume:", suffix="%" .. ao_mute,

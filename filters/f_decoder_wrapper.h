@@ -106,6 +106,10 @@ struct mp_decoder {
     // Bidirectional filter; takes MP_FRAME_PACKET for input.
     struct mp_filter *f;
 
+    // A packet rejected by the passthrough muxer. Owned by f until the wrapper
+    // takes it for PCM fallback, so the failed packet is not lost or recorded twice.
+    struct demux_packet *failed_packet;
+
     // Can be set by decoder impl. on init for "special" functionality.
     int (*control)(struct mp_filter *f, enum dec_ctrl cmd, void *arg);
 };
