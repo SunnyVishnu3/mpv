@@ -103,6 +103,7 @@ static struct JNIAudioTrack {
     jmethodID getTimestamp;
     jmethodID getLatency;
     jmethodID getMinBufferSize;
+    jmethodID isDirectPlaybackSupported;
     jmethodID getNativeOutputSampleRate;
     jint STATE_INITIALIZED;
     jint PLAYSTATE_STOPPED;
@@ -136,6 +137,7 @@ static const struct MPJniField AudioTrack_mapping[] = {
     {"getPlaybackHeadPosition", "()I", MP_JNI_METHOD, OFFSET(getPlaybackHeadPosition), 1},
     {"getLatency", "()I", MP_JNI_METHOD, OFFSET(getLatency), 1},
     {"getMinBufferSize", "(III)I", MP_JNI_STATIC_METHOD, OFFSET(getMinBufferSize), 1},
+    {"isDirectPlaybackSupported", "(Landroid/media/AudioFormat;Landroid/media/AudioAttributes;)Z", MP_JNI_STATIC_METHOD, OFFSET(isDirectPlaybackSupported), 0},
     {"getNativeOutputSampleRate", "(I)I", MP_JNI_STATIC_METHOD, OFFSET(getNativeOutputSampleRate), 1},
     {"WRITE_BLOCKING", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(WRITE_BLOCKING), 0},
     {"WRITE_NON_BLOCKING", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(WRITE_NON_BLOCKING), 0},
@@ -330,6 +332,29 @@ static int AudioTrack_New(struct ao *ao)
         jobject attr = MP_JNI_CALL_OBJECT(attr_builder, AudioAttributesBuilder.build);
         MP_JNI_LOCAL_FREEP(&attr_builder);
 
+        if (MP_JNI_EXCEPTION_LOG(ao) < 0 || !format || !attr) {
+            MP_JNI_LOCAL_FREEP(&format);
+            MP_JNI_LOCAL_FREEP(&attr);
+            return -1;
+        }
+
+        // Query the actual IEC61937 carrier, not the source codec's channel layout.
+        // API 29 added this query; older systems still use AudioTrack initialization.
+        if (p->format == AudioFormat.ENCODING_IEC61937 &&
+            AudioTrack.isDirectPlaybackSupported) {
+            jboolean supported = (*env)->CallStaticBooleanMethod(
+                env, AudioTrack.clazz, AudioTrack.isDirectPlaybackSupported, format, attr);
+            if (MP_JNI_EXCEPTION_LOG(ao) < 0) {
+                MP_WARN(ao, "Unable to query IEC61937 support; trying AudioTrack\n");
+            } else if (!supported) {
+                MP_WARN(ao, "IEC61937 carrier not supported: %d Hz, channel mask 0x%x\n",
+                        p->samplerate, (unsigned int)p->channel_config);
+                MP_JNI_LOCAL_FREEP(&format);
+                MP_JNI_LOCAL_FREEP(&attr);
+                return -1;
+            }
+        }
+
         audiotrack = MP_JNI_NEW(
             AudioTrack.clazz,
             AudioTrack.ctorV21,
@@ -383,17 +408,6 @@ static int AudioTrack_New(struct ao *ao)
         return -1;
 
     return 0;
-}
-
-static int AudioTrack_Recreate(struct ao *ao)
-{
-    struct priv *p = ao->priv;
-    JNIEnv *env = MP_JNI_GET_ENV(ao);
-
-    MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.release);
-    MP_JNI_EXCEPTION_LOG(ao);
-    MP_JNI_GLOBAL_FREEP(&p->audiotrack);
-    return AudioTrack_New(ao);
 }
 
 static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao)
@@ -605,10 +619,10 @@ static MP_THREAD_VOID ao_thread(void *arg)
             if (ret >= 0) {
                 p->written_frames += ret / ao->sstride;
             } else if (ret == AudioManager.ERROR_DEAD_OBJECT) {
-                MP_WARN(ao, "AudioTrack.write failed with ERROR_DEAD_OBJECT. Recreating AudioTrack...\n");
-                if (AudioTrack_Recreate(ao) < 0) {
-                    MP_ERR(ao, "AudioTrack_Recreate failed\n");
-                }
+                MP_WARN(ao, "AudioTrack.write failed with ERROR_DEAD_OBJECT. Reloading audio output...\n");
+                // Renegotiate the carrier and reset playback state in the core.
+                ao_request_reload(ao);
+                break;
             } else {
                 MP_ERR(ao, "AudioTrack.write failed with %d\n", ret);
             }
